@@ -1,0 +1,554 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{geometry}
+\usepackage{tikz}
+\usepackage{float}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric}
+\geometry{margin=2.5cm}
+
+% Configuración de listings para código MIPS
+\lstdefinestyle{mipsstyle}{
+    language={[MIPS]Assembler},
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{green!60!black},
+    stringstyle=\color{red},
+    numbers=left,
+    numberstyle=\tiny,
+    numbersep=5pt,
+    frame=single,
+    breaklines=true,
+    showstringspaces=false,
+    tabsize=4
+}
+
+\title{\textbf{Informe Técnico: Interrupciones y Excepciones en MIPS32} \\
+\large Mecanismos de Gestión de Eventos Asíncronos y Síncronos}
+\author{Arquitectura de Computadores}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Ciclo de una Interrupción de Hardware}
+
+\subsection{Diagrama del Ciclo de Interrupción}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[node distance=1.5cm, auto, >=stealth']
+    % Nodos del diagrama
+    \node[rectangle, draw, fill=blue!20, minimum width=3cm, minimum height=1cm] (evento) {Evento Hardware};
+    \node[rectangle, draw, fill=green!20, minimum width=3cm, minimum height=1cm, below=of evento] (irq) {Señal IRQ activada};
+    \node[rectangle, draw, fill=yellow!20, minimum width=3cm, minimum height=1cm, below=of irq] (cpu) {CPU verifica interrupciones};
+    \node[rectangle, draw, fill=orange!20, minimum width=3cm, minimum height=1cm, below=of cpu] (salto) {Salto a rutina de servicio};
+    \node[rectangle, draw, fill=red!20, minimum width=3cm, minimum height=1cm, below=of salto] (contexto) {Guardar contexto};
+    \node[rectangle, draw, fill=purple!20, minimum width=3cm, minimum height=1cm, below=of contexto] (servicio) {Ejecutar rutina ISR};
+    \node[rectangle, draw, fill=red!20, minimum width=3cm, minimum height=1cm, below=of servicio] (restaurar) {Restaurar contexto};
+    \node[rectangle, draw, fill=green!20, minimum width=3cm, minimum height=1cm, below=of restaurar] (retorno) {Retorno de interrupción};
+    
+    % Flechas
+    \draw[->, thick] (evento) -- (irq);
+    \draw[->, thick] (irq) -- (cpu);
+    \draw[->, thick] (cpu) -- (salto);
+    \draw[->, thick] (salto) -- (contexto);
+    \draw[->, thick] (contexto) -- (servicio);
+    \draw[->, thick] (servicio) -- (restaurar);
+    \draw[->, thick] (restaurar) -- (retorno);
+    
+    % Descripciones laterales
+    \node[right=of evento, xshift=1cm] (desc1) {Dispositivo genera interrupción};
+    \node[right=of irq, xshift=1cm] (desc2) {Línea de interrupción activada};
+    \node[right=of cpu, xshift=1cm] (desc3) {CPU verifica IE bit};
+    \node[right=of salto, xshift=1cm] (desc4) {PC $\leftarrow$ Vector de interrupción};
+    \node[right=of contexto, xshift=1cm] (desc5) {Guardar EPC, Status, registros};
+    \node[right=of servicio, xshift=1cm] (desc6) {Atender al dispositivo};
+    \node[right=of restaurar, xshift=1cm] (desc7) {Restaurar registros};
+    \node[right=of retorno, xshift=1cm] (desc8) {eret $\rightarrow$ PC = EPC};
+    
+\end{tikzpicture}
+\caption{Ciclo completo de una interrupción de hardware}
+\end{figure}
+
+\subsection{Descripción Paso a Paso}
+\begin{enumerate}
+    \item \textbf{Evento Hardware}: El dispositivo periférico completa una operación (ej: carácter recibido)
+    \item \textbf{Activación IRQ}: El dispositivo activa su línea de interrupción
+    \item \textbf{Verificación por CPU}: Al final de cada instrucción, la CPU verifica si hay interrupciones pendientes y si están habilitadas
+    \item \textbf{Salto a rutina}: La CPU guarda la dirección de retorno en EPC y salta al vector de interrupción
+    \item \textbf{Guardar contexto}: El software guarda los registros que va a utilizar
+    \item \textbf{Ejecutar ISR}: Se ejecuta la rutina de servicio de interrupción
+    \item \textbf{Restaurar contexto}: Se recuperan los registros guardados
+    \item \textbf{Retorno}: Instrucción \texttt{eret} restaura el PC desde EPC
+\end{enumerate}
+
+\section{Sondeo vs. Interrupciones}
+
+\subsection{Cuadro Comparativo}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{5cm}|p{5cm}|}
+\hline
+\textbf{Sondeo (Polling)} & \textbf{Interrupciones} \\
+\hline
+CPU verifica constantemente el estado del dispositivo & Dispositivo notifica a la CPU cuando está listo \\
+\hline
+Espera activa (busy-waiting) & CPU puede ejecutar otras tareas mientras espera \\
+\hline
+Alta latencia de respuesta & Respuesta inmediata al evento \\
+\hline
+Simple de implementar & Mayor complejidad (hardware y software) \\
+\hline
+Ineficiente para eventos poco frecuentes & Eficiente para eventos asíncronos \\
+\hline
+Consume CPU constantemente & CPU ocupada solo durante la atención \\
+\hline
+\end{tabular}
+\caption{Comparación entre sondeo e interrupciones}
+\end{table}
+
+\subsection{Ejemplo en MIPS32}
+\begin{lstlisting}[style=mipsstyle, caption={Sondeo vs. Interrupción}]
+# SONDEO: Espera activa
+polling_teclado:
+    lw $t0, KBD_CONTROL
+    andi $t0, $t0, 1
+    beqz $t0, polling_teclado   # Espera activa
+    lw $v0, KBD_DATA            # Leer dato
+    
+# INTERRUPCIÓN: Configuración
+configurar_int_teclado:
+    li $t0, KBD_CONTROL
+    li $t1, 0x3                 # Habilitar interrupción
+    sw $t1, 0($t0)
+    # CPU sigue con otras tareas
+\end{lstlisting}
+
+\section{Ventajas de las Interrupciones en el Uso del Procesador}
+
+\begin{itemize}
+    \item \textbf{Concurrencia}: Permite solapar operaciones de E/S con cómputo
+    \item \textbf{Eficiencia energética}: CPU puede entrar en modos de bajo consumo mientras espera
+    \item \textbf{Multitarea}: Base para sistemas operativos con tiempo compartido
+    \item \textbf{Latencia}: Respuesta inmediata a eventos críticos
+    \item \textbf{Rendimiento}: Aprovechamiento óptimo del CPU (hasta 100\% de utilización en cómputo útil)
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+    \draw[->] (0,0) -- (10,0) node[right] {tiempo};
+    
+    % Sin interrupciones (polling)
+    \foreach \x in {0,1.5,3,4.5,6,7.5,9} {
+        \fill[red] (\x,0.5) rectangle ++(0.5,0.3);
+    }
+    \node at (5,1) {Polling: CPU siempre ocupada};
+    
+    % Con interrupciones
+    \fill[green] (0,1.5) rectangle (2,1.8);
+    \fill[green] (2.5,1.5) rectangle (4.5,1.8);
+    \fill[green] (5,1.5) rectangle (7,1.8);
+    \fill[green] (7.5,1.5) rectangle (9.5,1.8);
+    
+    \foreach \x in {2,4.5,7,9.5} {
+        \fill[blue] (\x,1.5) rectangle ++(0.3,0.3);
+    }
+    \node at (5,2) {Interrupciones: CPU en cómputo útil (verde) con breves interrupciones (azul)};
+    
+\end{tikzpicture}
+\caption{Comparativa de uso de CPU: Polling vs. Interrupciones}
+\end{figure}
+
+\section{Registros Especiales en MIPS32 para Interrupciones}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{Registro} & \textbf{Número} & \textbf{Función} \\
+\hline
+Status (SR) & $12 & Control de interrupciones (IE, IM, UM) \\
+\hline
+Cause & $13 & Identifica causa de excepción/interrupción \\
+\hline
+EPC & $14 & Dirección de retorno (PC interrumpido) \\
+\hline
+BadVAddr & $8 & Dirección que causó el fallo \\
+\hline
+Count & $9 & Temporizador (incrementa cada ciclo) \\
+\hline
+Compare & $11 & Valor de comparación para interrupción de timer \\
+\hline
+\end{tabular}
+\caption{Registros CP0 relacionados con interrupciones}
+\end{table}
+
+\subsection{Bits importantes del registro Status}
+\begin{itemize}
+    \item \textbf{IEc (bit 0)}: Interrupt Enable global (0=deshabilitadas, 1=habilitadas)
+    \item \textbf{IM (bits 8-15)}: Interrupt Mask - habilita interrupciones específicas
+    \item \textbf{UM (bit 1)}: Modo usuario (1) o kernel (0)
+    \item \textbf{EXL (bit 1)}: Exception Level (1 si estamos atendiendo excepción)
+\end{itemize}
+
+\begin{lstlisting}[style=mipsstyle, caption={Manipulación de registros CP0}]
+# Leer registro Status
+mfc0 $t0, $12
+
+# Habilitar interrupciones globales
+ori $t0, $t0, 0x1
+mtc0 $t0, $12
+
+# Deshabilitar interrupciones
+mfc0 $t0, $12
+andi $t0, $t0, 0xFFFFFFFE
+mtc0 $t0, $12
+\end{lstlisting}
+
+\section{Necesidad de Guardar el Contexto}
+
+\subsection{¿Por qué es necesario?}
+\begin{enumerate}
+    \item \textbf{Transparencia}: El programa interrumpido no debe notar la interrupción
+    \item \textbf{Reanudación correcta}: Debe poder continuar exactamente donde se detuvo
+    \item \textbf{Valores de registros}: La ISR puede modificar registros sin afectar al programa
+    \item \textbf{Estado del procesador}: EPC y Status deben preservarse
+\end{enumerate}
+
+\subsection{Contexto mínimo a guardar}
+\begin{itemize}
+    \item Registros que modificará la ISR (por convención, $t0-$t9 si se usan)
+    \item EPC (Exception Program Counter)
+    \item Status (para restaurar estado de interrupciones)
+\end{itemize}
+
+\begin{lstlisting}[style=mipsstyle, caption={Guardado de contexto típico}]
+ISR_teclado:
+    # Guardar contexto
+    sw $t0, contexto_t0
+    sw $t1, contexto_t1
+    sw $ra, contexto_ra
+    mfc0 $t0, $14           # EPC
+    sw $t0, contexto_epc
+    
+    # Atender interrupción
+    # ... código de la ISR ...
+    
+    # Restaurar contexto
+    lw $t0, contexto_t0
+    lw $t1, contexto_t1
+    lw $ra, contexto_ra
+    lw $t0, contexto_epc
+    mtc0 $t0, $14
+    eret
+\end{lstlisting}
+
+\section{Momentos de Generación de Excepciones}
+
+\subsection{a) Situaciones que generan excepciones}
+
+\begin{enumerate}
+    \item \textbf{Desbordamiento aritmético}: Resultado de operación excede rango
+    \item \textbf{Fallo de dirección}: Acceso a memoria no alineado o fuera de rango
+    \item \textbf{Instrucción ilegal}: Código de operación no válido
+    \item \textbf{División por cero}: Operación aritmética inválida
+    \item \textbf{Syscall}: Llamada al sistema explícita
+    \item \textbf{Breakpoint}: Instrucción de depuración
+    \item \textbf{Fallo de página}: Acceso a memoria no residente
+    \item \textbf{Protección}: Acceso a región privilegiada desde modo usuario
+\end{enumerate}
+
+\subsection{b) Etapas del pipeline que provocan excepciones}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Etapa} & \textbf{Excepciones posibles} \\
+\hline
+IF (Fetch) & Fallo de instrucción, dirección inválida \\
+\hline
+ID (Decode) & Instrucción ilegal, syscall, breakpoint \\
+\hline
+EX (Execute) & Desbordamiento aritmético, división por cero \\
+\hline
+MEM (Memory) & Fallo de dirección, fallo de página \\
+\hline
+WB (Write Back) & Generalmente no genera excepciones nuevas \\
+\hline
+\end{tabular}
+\caption{Excepciones por etapa del pipeline}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+    \draw[->] (0,0) -- (12,0) node[right] {Ciclos};
+    
+    % Pipeline stages
+    \foreach \x/\c in {0/IF, 1.5/ID, 3/EX, 4.5/MEM, 6/WB} {
+        \draw[fill=blue!20] (\x,1) rectangle ++(1.2,0.5);
+        \node at (\x+0.6,1.25) {\c};
+    }
+    
+    % Excepción en EX
+    \draw[red, thick, ->] (3.6,1.5) -- (3.6,2);
+    \node[red] at (3.6,2.3) {Excepción aquí};
+    
+    \draw[red, dashed] (0,2.5) -- (12,2.5);
+    \node at (1,2.7) {Instrucción anterior completa};
+    \node at (9,2.7) {Instrucciones posteriores se descartan};
+    
+\end{tikzpicture}
+\caption{Manejo de excepción en pipeline MIPS}
+\end{figure}
+
+\section{Estrategias de Tratamiento de Excepciones e Interrupciones}
+
+\subsection{a) Diferencias entre Interrupciones y Excepciones}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Interrupciones} & \textbf{Excepciones} \\
+\hline
+Asíncronas (eventos externos) & Síncronas (causadas por la instrucción) \\
+\hline
+Ocurren en cualquier momento & Ocurren en momentos predecibles \\
+\hline
+No están relacionadas con la instrucción actual & Causadas por la instrucción actual \\
+\hline
+Ej: teclado, timer, disco & Ej: división por cero, syscall \\
+\hline
+Se pueden enmascarar (deshabilitar) & Generalmente no enmascarables \\
+\hline
+\end{tabular}
+\caption{Diferencias entre interrupciones y excepciones}
+\end{table}
+
+\subsection{b) Estrategias de Tratamiento en MIPS32}
+
+\textbf{Estrategia 1: Vector de excepciones único}
+\begin{itemize}
+    \item Todas las excepciones saltan a la misma dirección (0x80000180)
+    - El software debe leer el registro Cause para determinar la causa
+\end{itemize}
+
+\textbf{Estrategia 2: Vectores múltiples (MIPS32)}
+\begin{itemize}
+    \item Diferentes direcciones para diferentes tipos de excepción
+    \item Configurable mediante registros CP0
+\end{itemize}
+
+\subsection{Redirección a la rutina de servicio}
+\begin{enumerate}
+    \item La hardware guarda PC en EPC
+    \item Fuerza PC a la dirección del vector de excepciones
+    \item Cambia a modo kernel (EXL bit en Status)
+    \item Deshabilita interrupciones
+\end{enumerate}
+
+\subsection{Función del registro EPC}
+\textbf{EPC (Exception Program Counter)} almacena la dirección de la instrucción que causó la excepción o la siguiente instrucción (según el tipo). Es fundamental para:
+\begin{itemize}
+    \item Reanudar la ejecución después de la excepción
+    \item Instrucción \texttt{eret} copia EPC a PC
+    \item Permite reintentar instrucciones (ej: fallo de página)
+\end{itemize}
+
+\section{Habilitación de Interrupciones}
+
+\subsection{a) Habilitación en dispositivos y procesador}
+
+\textbf{Teclado:}
+\begin{lstlisting}[style=mipsstyle]
+# Habilitar interrupciones en teclado
+li $t0, KBD_CONTROL
+li $t1, 0x3           # Bit0 = enable, Bit1 = interrupt enable
+sw $t1, 0($t0)
+\end{lstlisting}
+
+\textbf{Pantalla:}
+\begin{lstlisting}[style=mipsstyle]
+# Habilitar interrupciones en pantalla
+li $t0, CON_CONTROL
+li $t1, 0x3           # Bit0 = ready, Bit1 = interrupt enable
+sw $t1, 0($t0)
+\end{lstlisting}
+
+\textbf{Procesador (registro Status):}
+\begin{lstlisting}[style=mipsstyle]
+# Habilitar interrupciones globales
+mfc0 $t0, $12
+ori $t0, $t0, 0x1     # IEc = 1
+mtc0 $t0, $12
+
+# Habilitar interrupción específica (ej: timer)
+mfc0 $t0, $12
+ori $t0, $t0, 0x8000  # IM7 (timer) = 1
+mtc0 $t0, $12
+\end{lstlisting}
+
+\subsection{b) Consecuencias de habilitar solo en dispositivos}
+Si habilitamos interrupciones en dispositivos pero no en el procesador:
+\begin{itemize}
+    \item Los dispositivos generarán solicitudes de interrupción
+    \item El procesador las ignorará (IEc = 0 en Status)
+    \item Posibles consecuencias:
+    \begin{itemize}
+        \item Desbordamiento de buffers en dispositivos
+        \item Pérdida de datos (caracteres de teclado no leídos)
+        \item Dispositivos pueden quedar bloqueados esperando servicio
+        \item Comportamiento indefinido del sistema
+    \end{itemize}
+\end{itemize}
+
+\section{Procesamiento de Interrupciones}
+
+\subsection{a) Interrupción de reloj paso a paso}
+
+\textbf{Fase Hardware:}
+\begin{enumerate}
+    \item El temporizador (Count == Compare) genera señal de interrupción
+    \item Se activa el bit correspondiente en registro Cause (IP)
+    \item Al final de la instrucción actual, CPU verifica:
+    \begin{itemize}
+        \item IEc = 1 (interrupciones habilitadas)
+        \item IM correspondiente = 1 (máscara habilitada)
+        \item EXL = 0 (no estamos en excepción)
+    \end{itemize}
+    \item Guarda PC en EPC
+    \item Guarda Status en un registro temporal
+    \item Fuerza PC a 0x80000180 (vector de excepciones)
+    \item Activa EXL = 1, deshabilita interrupciones
+\end{enumerate}
+
+\textbf{Fase Software (ISR):}
+\begin{enumerate}
+    \item Guarda contexto (registros generales en pila)
+    \item Lee Cause para verificar que es interrupción de timer
+    \item Reconoce la interrupción (resetea timer)
+    \item Ejecuta rutina de servicio (ej: scheduler, contador de tiempo)
+    \item Restaura contexto (registros generales)
+    \item Ejecuta \texttt{eret} (restaura PC desde EPC, Status)
+\end{enumerate}
+
+\subsection{b) Importancia de guardar el contexto}
+\begin{itemize}
+    \item \textbf{Registros generales}: Si la ISR modifica registros, el programa interrumpido vería valores corruptos
+    \item \textbf{EPC}: Necesario para reanudar la ejecución donde se detuvo
+    \item \textbf{Status}: Para restaurar el estado de interrupciones previo
+    \item \textbf{Anidamiento}: Permite que ocurran interrupciones dentro de la ISR si se re-habilitan
+\end{itemize}
+
+\section{Interrupciones de Reloj y Control de Ejecución}
+
+\subsection{a) Usos de la interrupción de reloj}
+
+\textbf{Prevenir bucles infinitos:}
+\begin{lstlisting}[style=mipsstyle, caption={Timer como watchdog}]
+ISR_timer:
+    # Incrementar contador de ticks
+    lw $t0, ticks
+    addi $t0, $t0, 1
+    sw $t0, ticks
+    
+    # Verificar tiempo máximo por programa
+    lw $t1, tiempo_ejecucion
+    bgt $t0, $t1, matar_programa
+    
+    # Reanudar
+    j fin_ISR_timer
+\end{lstlisting}
+
+\textbf{Límite de tiempo de ejecución:}
+\begin{itemize}
+    \item Cada programa tiene un quantum de tiempo asignado
+    \item La interrupción de reloj permite al scheduler cambiar de tarea
+    \item Si un programa excede su tiempo, se fuerza un cambio de contexto
+\end{itemize}
+
+\subsection{b) Manejo si el programa termina antes}
+\begin{enumerate}
+    \item El programa termina voluntariamente (syscall exit)
+    \item El sistema operativo remueve el programa de la cola de listos
+    \item Se desactiva el timer asociado (o se ignora)
+    \item Si ocurre la interrupción, la ISR detecta que no hay programa activo y simplemente retorna
+\end{enumerate}
+
+\begin{lstlisting}[style=mipsstyle]
+ISR_timer:
+    # Verificar si hay programa activo
+    lw $t0, programa_activo
+    beqz $t0, fin_ISR_timer   # No hay programa, ignorar
+    
+    # Manejar cambio de contexto normalmente
+    # ...
+\end{lstlisting}
+
+\section{Análisis y Discusión de Resultados}
+
+\subsection{Implementación de los Programas Prácticos}
+
+\subsubsection{Buffer de Teclado con Filtro}
+\begin{itemize}
+    \item \textbf{Aciertos}: Uso correcto de buffer circular, filtrado eficiente de caracteres
+    \item \textbf{Limitaciones}: Espera activa en lugar de interrupciones reales
+    \item \textbf{Mejora}: Se podría implementar con interrupciones para eficiencia
+\end{itemize}
+
+\subsubsection{Semáforo con Pulsador}
+\begin{itemize}
+    \item \textbf{Máquina de estados}: Implementación clara y mantenible
+    \item \textbf{Temporización}: Precisión adecuada para simulación
+    \item \textbf{Interactividad}: Respuesta inmediata al pulsador
+\end{itemize}
+
+\subsection{Evaluación de los Mecanismos de Interrupción}
+
+\textbf{Ventajas observadas:}
+\begin{itemize}
+    \item Capacidad de respuesta a eventos asíncronos
+    \item Aislamiento entre tareas del sistema
+    \item Escalabilidad para múltiples dispositivos
+\end{itemize}
+
+\textbf{Desafíos encontrados:}
+\begin{itemize}
+    \item Complejidad en la gestión de prioridades
+    \item Necesidad de proteger secciones críticas
+    \item Sobrecarga por cambio de contexto
+\end{itemize}
+
+\subsection{Conclusiones}
+
+\begin{enumerate}
+    \item Las interrupciones son fundamentales para sistemas interactivos y de tiempo real
+    \item MIPS32 proporciona un mecanismo elegante y eficiente para gestión de excepciones
+    \item El balance entre simplicidad (polling) y eficiencia (interrupciones) depende de la aplicación
+    \item La correcta gestión del contexto es crítica para la estabilidad del sistema
+    \item Los temporizadores son la base para sistemas multitarea por tiempo compartido
+\end{enumerate}
+
+\subsection{Recomendaciones para Implementaciones Reales}
+\begin{itemize}
+    \item Utilizar interrupciones en lugar de polling para E/S de baja frecuencia
+    \item Implementar prioridades para interrupciones críticas
+    \item Diseñar ISR cortas y eficientes
+    \item Proteger secciones críticas con deshabilitado temporal de interrupciones
+    \item Utilizar el timer para watchdog y time-sharing
+\end{itemize}
+
+\end{document}
